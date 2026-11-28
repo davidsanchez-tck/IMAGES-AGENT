@@ -1,0 +1,61 @@
+# GitHub Action del CDN de imágenes (GH_REPO). Fuente: ai-mkt-automation/tools/email/cdn-purga-semanal.yml
+# Se instala en el CDN como .github/workflows/purga-semanal.yml (ver reference/email/cdn-purge.md).
+#
+# Cada día: borra de main las imágenes que llevan 7 días sin tocarse (el email entregado usa el CDN
+# de SFMC/AJO/Braze; GitHub solo sirve para EOA) y rehace main como un único commit, para que lo
+# borrado tampoco se pueda abrir por la URL de un commit antiguo. Como el historial se rehace a
+# diario, la fecha de última subida de cada imagen se guarda en fechas.tsv (ruta opaca → fecha).
+name: Purga de imágenes con una semana sin tocarse
+on:
+  schedule:
+    - cron: "0 3 * * *"   # cada día a las 04:00 Madrid en invierno / 05:00 en verano (03:00 UTC)
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: purga-semanal
+jobs:
+  purga:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Borrar lo que lleva una semana sin tocarse y rehacer el historial
+        run: |
+          set -euo pipefail
+          antes=$(git rev-parse HEAD)
+          raiz=$(git rev-list --max-parents=0 HEAD | tail -1)
+          git diff --name-only "$raiz" HEAD > /tmp/cambiadas
+          python3 - <<'EOF'
+          import datetime, pathlib, subprocess
+          hoy = datetime.date.today()
+          limite = hoy - datetime.timedelta(days=7)
+          fechas_f = pathlib.Path("fechas.tsv")
+          fechas = {}
+          if fechas_f.exists():
+              for linea in fechas_f.read_text().splitlines():
+                  ruta, _, f = linea.partition("\t")
+                  if ruta and f:
+                      fechas[ruta] = datetime.date.fromisoformat(f)
+          cambiadas = set(pathlib.Path("/tmp/cambiadas").read_text().split())
+          rutas = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
+                                 check=True).stdout.split()
+          vivas, borradas = {}, []
+          for r in rutas:
+              if r.startswith(".github/") or r == "fechas.tsv":
+                  continue
+              f = hoy if (r in cambiadas or r not in fechas) else fechas[r]
+              if f <= limite:
+                  borradas.append(r)
+              else:
+                  vivas[r] = f
+          for r in borradas:
+              subprocess.run(["git", "rm", "-q", "--", r], check=True)
+          fechas_f.write_text("".join(f"{r}\t{f.isoformat()}\n" for r, f in sorted(vivas.items())))
+          subprocess.run(["git", "add", "fechas.tsv"], check=True)
+          print(f"{len(borradas)} imagen(es) borradas; {len(vivas)} siguen (subidas hace < 7 días)")
+          EOF
+          git checkout -q --orphan purgado
+          git -c user.name=cdn -c user.email=cdn@users.noreply.github.com commit -qm "limpieza"
+          # --force-with-lease: si alguien sube mientras corre, no lo pisa (falla y se repite mañana).
+          git push --force-with-lease=main:"$antes" origin purgado:main
